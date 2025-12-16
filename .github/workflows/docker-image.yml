@@ -1,0 +1,129 @@
+name: 3-Tier-DevSecOps-CI-CD
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '23'
+  SONAR_PROJECT_KEY: 'NodeJS-Project'
+  SONAR_PROJECT_NAME: 'NodeJS-Project'
+  DOCKER_REGISTRY: 'docker.io'
+  DOCKER_IMAGE_F: 'adijaiswal/frontend'
+  DOCKER_IMAGE_B: 'adijaiswal/backend'
+  K8S_CLUSTER: 'devopsshack-cluster'
+  K8S_SERVER: 'https://AFC6FCFF5360B30D5E8950396E38A8C4.gr7.ap-south-1.eks.amazonaws.com'
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      # ---------- Git Checkout ----------
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------- Node.js ----------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # ---------- Frontend & Backend Compilation ----------
+      - name: Frontend syntax check
+        run: |
+          cd client
+          find . -name "*.js" -exec node --check {} +
+      - name: Backend syntax check
+        run: |
+          cd api
+          find . -name "*.js" -exec node --check {} +
+
+      # ---------- GitLeaks ----------
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------- SonarQube ----------
+      - name: SonarQube Scan
+        uses: sonarqube-quality-gate-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.projectName=${{ env.SONAR_PROJECT_NAME }}
+
+      # ---------- Trivy FS Scan ----------
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'table'
+          output: 'fs-report.html'
+          path: '.'
+
+      # ---------- Docker Build & Image Scan ----------
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build & push backend
+        run: |
+          cd api
+          docker build -t ${{ env.DOCKER_IMAGE_B }}:latest .
+          docker push ${{ env.DOCKER_IMAGE_B }}:latest
+      - name: Trivy scan backend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.DOCKER_IMAGE_B }}:latest'
+          format: 'table'
+          output: 'backend-image-report.html'
+
+      - name: Build & push frontend
+        run: |
+          cd client
+          docker build -t ${{ env.DOCKER_IMAGE_F }}:latest .
+          docker push ${{ env.DOCKER_IMAGE_F }}:latest
+      - name: Trivy scan frontend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.DOCKER_IMAGE_F }}:latest'
+          format: 'table'
+          output: 'frontend-image-report.html'
+
+  deploy:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    environment: production  # enables manual approval gate
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Deploy to prod
+        run: |
+          kubectl apply -f k8s-prod/sc.yaml
+          sleep 20
+          kubectl apply -f k8s-prod/mysql.yaml -n prod
+          kubectl apply -f k8s-prod/backend.yaml -n prod
+          kubectl apply -f k8s-prod/frontend.yaml -n prod
+          kubectl apply -f k8s-prod/ci.yaml
+          kubectl apply -f k8s-prod/ingress.yaml -n prod
+          sleep 30
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n prod
+          kubectl get ingress -n prod
